@@ -1,0 +1,663 @@
+# Update main.py with instance locking
+#!/usr/bin/env python3
+"""
+Speech2Text Pro - Voice Typing for macOS
+WITH INSTANCE LOCKING TO PREVENT DUPLICATES
+"""
+
+# === INSTANCE LOCKING - MUST BE FIRST ===
+import os
+import sys
+import socket
+import fcntl
+import tempfile
+from pathlib import Path
+
+# Create a lock file to prevent multiple instances
+lock_file = Path(tempfile.gettempdir()) / "speech2text.lock"
+try:
+    # Try to acquire lock
+    file_handle = open(lock_file, 'w')
+    fcntl.lockf(file_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # Store handle to keep lock alive
+    LOCK_FILE_HANDLE = file_handle
+    LOCK_FILE_HANDLE.write(str(os.getpid()))
+    LOCK_FILE_HANDLE.flush()
+except (IOError, OSError):
+    # Lock already held - another instance is running
+    try:
+        with open(lock_file, 'r') as f:
+            pid = f.read().strip()
+        print(f"Speech2Text is already running (PID: {pid})")
+        
+        # Show a notification to the user
+        os.system(f'osascript -e \'display notification "App is already running" with title "Speech2Text"\'')
+        
+        # Try to bring existing instance to front
+        os.system(f'osascript -e \'tell application "System Events" to tell process "Speech2Text Pro" to set frontmost to true\'')
+        
+        sys.exit(0)
+    except:
+        sys.exit(0)
+
+# === REST OF YOUR IMPORTS ===
+import rumps
+import sounddevice as sd
+import numpy as np
+import threading
+import queue
+import logging
+import tempfile
+from pathlib import Path
+import time
+import pyperclip
+import json
+import subprocess
+from datetime import datetime
+import signal
+
+# Setup logging
+log_dir = Path.home() / ".local" / "share" / "speech2text" / "logs"
+log_dir.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    filename=log_dir / "app.log",
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Add cleanup for lock file on exit
+def cleanup_lock(signum=None, frame=None):
+    try:
+        LOCK_FILE_HANDLE.close()
+        lock_file.unlink()
+    except:
+        pass
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, cleanup_lock)
+signal.signal(signal.SIGTERM, cleanup_lock)
+
+# === REST OF YOUR EXISTING CODE (Settings, HotkeyManager, SettingsWindow, Speech2TextApp) ===
+# Copy all your existing classes here exactly as they were
+# [Your existing Settings, HotkeyManager, SettingsWindow classes]
+# [Your existing Speech2TextApp class]
+
+class Settings:
+    """Settings manager"""
+    def __init__(self):
+        self.config_dir = Path.home() / ".config" / "speech2text"
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.config_file = self.config_dir / "settings.json"
+        self.defaults = {
+            "model_size": "tiny",
+            "language": "en",
+            "auto_paste": True,
+            "vad_enabled": True,
+            "vad_threshold": 0.5,
+            "silence_timeout": 1.5,
+            "hotkey_start": "ctrl+option+s",
+            "hotkey_stop": "ctrl+option+shift+s",
+            "start_at_login": False,
+            "show_notifications": True
+        }
+        self.settings = self.load()
+    
+    def load(self):
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r') as f:
+                    return {**self.defaults, **json.load(f)}
+            except:
+                return self.defaults.copy()
+        return self.defaults.copy()
+    
+    def save(self):
+        with open(self.config_file, 'w') as f:
+            json.dump(self.settings, f, indent=2)
+    
+    def get(self, key):
+        return self.settings.get(key, self.defaults.get(key))
+    
+    def set(self, key, value):
+        self.settings[key] = value
+        self.save()
+
+class HotkeyManager:
+    """Global hotkey manager using pynput"""
+    def __init__(self, on_start, on_stop):
+        self.on_start = on_start
+        self.on_stop = on_stop
+        self.listener = None
+        self.hotkey_start = None
+        self.hotkey_stop = None
+        self.current_keys = set()
+        self.running = False
+        
+    def start(self, start_key="ctrl+option+s", stop_key="ctrl+option+shift+s"):
+        try:
+            from pynput import keyboard
+            
+            # Parse hotkey strings
+            def parse_hotkey(hotkey_str):
+                keys = []
+                parts = hotkey_str.lower().split('+')
+                for part in parts:
+                    if part == 'ctrl':
+                        keys.append(keyboard.Key.ctrl)
+                    elif part == 'option' or part == 'alt':
+                        keys.append(keyboard.Key.alt)
+                    elif part == 'cmd' or part == 'command':
+                        keys.append(keyboard.Key.cmd)
+                    elif part == 'shift':
+                        keys.append(keyboard.Key.shift)
+                    elif part == 's':
+                        keys.append(keyboard.KeyCode.from_char('s'))
+                return set(keys)
+            
+            self.hotkey_start = parse_hotkey(start_key)
+            self.hotkey_stop = parse_hotkey(stop_key)
+            self.current_keys = set()
+            self.running = True
+            
+            def on_press(key):
+                if not self.running:
+                    return
+                try:
+                    self.current_keys.add(key)
+                    if self.current_keys == self.hotkey_start:
+                        # Use call_later to avoid blocking
+                        threading.Thread(target=self.on_start).start()
+                    elif self.current_keys == self.hotkey_stop:
+                        threading.Thread(target=self.on_stop).start()
+                except Exception as e:
+                    logging.error(f"Hotkey press error: {e}")
+            
+            def on_release(key):
+                try:
+                    self.current_keys.discard(key)
+                except:
+                    pass
+            
+            self.listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+            self.listener.start()
+            logging.info(f"Hotkeys registered: Start={start_key}, Stop={stop_key}")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to register hotkeys: {e}")
+            return False
+    
+    def stop(self):
+        self.running = False
+        if self.listener:
+            self.listener.stop()
+
+class SettingsWindow(rumps.Window):
+    """Settings window"""
+    def __init__(self, settings):
+        super().__init__(
+            title="Speech2Text Settings",
+            message="Configure your voice typing app:",
+            default_text="",
+            ok="Save",
+            cancel="Cancel"
+        )
+        self.settings = settings
+        
+        # Build settings text
+        self.default_text = f"""
+Model Size (tiny/base/small/medium): {settings.get('model_size')}
+Language (en/es/fr/de/zh): {settings.get('language')}
+Auto Paste (true/false): {settings.get('auto_paste')}
+VAD Enabled (true/false): {settings.get('vad_enabled')}
+VAD Threshold (0.1-0.9): {settings.get('vad_threshold')}
+Silence Timeout (seconds): {settings.get('silence_timeout')}
+Start Hotkey: {settings.get('hotkey_start')}
+Stop Hotkey: {settings.get('hotkey_stop')}
+Start at Login (true/false): {settings.get('start_at_login')}
+"""
+    
+    def run(self):
+        response = super().run()
+        if response.clicked:
+            # Parse settings
+            lines = response.text.strip().split('\n')
+            for line in lines:
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    key = key.strip().lower().replace(' ', '_')
+                    value = value.strip()
+                    
+                    # Convert types
+                    if value.lower() in ('true', 'false'):
+                        value = value.lower() == 'true'
+                    elif value.replace('.', '').isdigit():
+                        if '.' in value:
+                            value = float(value)
+                        else:
+                            value = int(value)
+                    
+                    self.settings.set(key, value)
+            
+            return True
+        return False
+
+class Speech2TextApp(rumps.App):
+    def __init__(self):
+        # App icon - using a microphone emoji
+        super(Speech2TextApp, self).__init__("🎤", title="Speech2Text")
+        self.menu = [
+            "Start Recording",
+            "Stop Recording",
+            None,
+            "Status: Ready",
+            None,
+            "Settings...",
+            "Model: tiny",
+            "Language: en",
+            None,
+            "Stats",
+            "Open Logs",
+            None,
+            "Quit"
+        ]
+        
+        # Initialize settings
+        self.settings = Settings()
+        
+        # Audio recording
+        self.is_recording = False
+        self.audio_queue = queue.Queue()
+        self.sample_rate = 16000
+        self.recording_start_time = None
+        self.last_audio_time = None
+        self.stream = None
+        
+        # Whisper model
+        self.model = None
+        self.model_size = self.settings.get('model_size')
+        
+        # Stats
+        self.stats = {
+            'recordings': 0,
+            'total_time': 0,
+            'total_chars': 0,
+            'session_start': datetime.now()
+        }
+        
+        # Hotkeys
+        self.hotkeys = HotkeyManager(
+            on_start=self.start_recording_hotkey,
+            on_stop=self.stop_recording_hotkey
+        )
+        self.hotkeys.start(
+            self.settings.get('hotkey_start'),
+            self.settings.get('hotkey_stop')
+        )
+        
+        # Update menu with current settings
+        self.update_menu()
+        
+        logging.info("Pro version initialized")
+    
+    def update_menu(self):
+        """Update menu items with current settings"""
+        # Update model display
+        for item in ["tiny", "base", "small", "medium"]:
+            self.menu[f"Model: {item}"] = None
+        self.menu.insert_after("Settings...", f"Model: {self.settings.get('model_size')}")
+        
+        # Update language display
+        for lang in ["en", "es", "fr", "de", "zh"]:
+            self.menu[f"Language: {lang}"] = None
+        self.menu.insert_after(f"Model: {self.settings.get('model_size')}", f"Language: {self.settings.get('language')}")
+    
+    @rumps.clicked("Start Recording")
+    def start_recording_menu(self, _):
+        self.start_recording()
+    
+    def start_recording_hotkey(self):
+        """Called by hotkey"""
+        # Use timer to avoid blocking hotkey thread
+        if not self.is_recording:
+            threading.Thread(target=self.start_recording).start()
+    
+    def start_recording(self):
+        """Start recording audio"""
+        if self.is_recording:
+            logging.warning("Already recording, ignoring start")
+            return
+        
+        logging.info("Start recording called")
+        
+        # Load model in background if needed
+        if self.model is None:
+            threading.Thread(target=self.load_model).start()
+        
+        self.is_recording = True
+        self.audio_queue = queue.Queue()
+        self.recording_start_time = time.time()
+        self.last_audio_time = time.time()
+        
+        def audio_callback(indata, frames, time, status):
+            """Called for each audio chunk"""
+            if status:
+                logging.warning(f"Audio status: {status}")
+            self.audio_queue.put(indata.copy())
+            self.last_audio_time = time.time()
+        
+        try:
+            # Get default microphone
+            devices = sd.query_devices()
+            default_input = sd.default.device[0]
+            device_name = devices[default_input]['name'] if default_input is not None else "default"
+            logging.info(f"Using microphone: {device_name}")
+            
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                callback=audio_callback,
+                dtype='float32',
+                blocksize=1024
+            )
+            self.stream.start()
+            
+            self.menu["Status: Ready"] = "Status: Recording..."
+            
+            if self.settings.get('show_notifications'):
+                rumps.notification("🎤 Speech2Text", "Recording Started", "Speak now...")
+            
+            logging.info(f"Recording started with device: {device_name}")
+            
+            # Start VAD monitor if enabled
+            if self.settings.get('vad_enabled'):
+                threading.Thread(target=self.vad_monitor).start()
+            
+        except Exception as e:
+            logging.error(f"Failed to start recording: {e}")
+            self.is_recording = False
+            self.menu["Status: Ready"] = "Status: Error"
+            if self.settings.get('show_notifications'):
+                rumps.alert("Error", f"Could not access microphone: {e}")
+    
+    def vad_monitor(self):
+        """Monitor for silence and auto-stop"""
+        while self.is_recording:
+            time.sleep(0.5)
+            if not self.is_recording:
+                break
+            silence_duration = time.time() - self.last_audio_time
+            if silence_duration > self.settings.get('silence_timeout'):
+                logging.info(f"Auto-stop after {silence_duration:.1f}s silence")
+                self.stop_recording()
+                break
+    
+    @rumps.clicked("Stop Recording")
+    def stop_recording_menu(self, _):
+        self.stop_recording()
+    
+    def stop_recording_hotkey(self):
+        """Called by hotkey"""
+        if self.is_recording:
+            threading.Thread(target=self.stop_recording).start()
+    
+    def stop_recording(self):
+        """Stop recording and transcribe"""
+        if not self.is_recording:
+            logging.warning("Not recording, ignoring stop")
+            return
+        
+        logging.info("Stop recording called")
+        
+        self.is_recording = False
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+        
+        recording_duration = time.time() - self.recording_start_time
+        self.stats['recordings'] += 1
+        self.stats['total_time'] += recording_duration
+        
+        self.menu["Status: Recording..."] = "Status: Transcribing..."
+        
+        if self.settings.get('show_notifications'):
+            rumps.notification("🎤 Speech2Text", "Processing", "Transcribing your speech...")
+        
+        logging.info(f"Recording stopped ({recording_duration:.1f}s)")
+        
+        # Transcribe in background
+        threading.Thread(target=self.transcribe_audio).start()
+    
+    def load_model(self):
+        """Load Whisper model in background"""
+        try:
+            from faster_whisper import WhisperModel
+            
+            self.menu["Status: Ready"] = "Status: Loading model..."
+            logging.info(f"Loading {self.settings.get('model_size')} model...")
+            
+            # Determine device
+            import torch
+            if torch.cuda.is_available():
+                device = "cuda"
+                compute_type = "float16"
+            else:
+                device = "cpu"
+                compute_type = "int8"
+            
+            self.model = WhisperModel(
+                self.settings.get('model_size'),
+                device=device,
+                compute_type=compute_type,
+                download_root=str(Path.home() / ".cache" / "whisper")
+            )
+            
+            self.menu["Status: Loading model..."] = "Status: Ready"
+            logging.info(f"Model loaded on {device}")
+            
+        except Exception as e:
+            logging.error(f"Failed to load model: {e}")
+            self.menu["Status: Loading model..."] = "Status: Error"
+    
+    def transcribe_audio(self):
+        """Transcribe with Whisper"""
+        try:
+            # Collect audio
+            audio_chunks = []
+            while not self.audio_queue.empty():
+                audio_chunks.append(self.audio_queue.get())
+            
+            if not audio_chunks:
+                self.menu["Status: Transcribing..."] = "Status: Ready"
+                if self.settings.get('show_notifications'):
+                    rumps.notification("Speech2Text", "No Audio", "No speech detected")
+                return
+            
+            audio = np.concatenate(audio_chunks, axis=0)
+            
+            # Save to temp file
+            temp_dir = Path(tempfile.gettempdir()) / "speech2text"
+            temp_dir.mkdir(exist_ok=True)
+            temp_file = temp_dir / f"recording_{int(time.time())}.wav"
+            
+            import scipy.io.wavfile as wav
+            wav.write(str(temp_file), self.sample_rate, audio)
+            
+            # Load model if needed
+            if self.model is None:
+                self.load_model()
+                if self.model is None:
+                    self.menu["Status: Transcribing..."] = "Status: Error"
+                    return
+            
+            # Transcribe
+            logging.info("Starting transcription...")
+            segments, info = self.model.transcribe(
+                str(temp_file),
+                beam_size=5,
+                language=self.settings.get('language'),
+                vad_filter=True,
+                vad_parameters=dict(
+                    threshold=0.5,
+                    min_speech_duration_ms=250,
+                    min_silence_duration_ms=100
+                )
+            )
+            
+            # Collect text
+            text_parts = []
+            for segment in segments:
+                text_parts.append(segment.text)
+            
+            full_text = " ".join(text_parts)
+            
+            # Update stats
+            self.stats['total_chars'] += len(full_text)
+            
+            if full_text.strip():
+                # Copy to clipboard
+                pyperclip.copy(full_text)
+                
+                # Auto-paste if enabled
+                if self.settings.get('auto_paste'):
+                    self.paste_text()
+                
+                # Show notification
+                if self.settings.get('show_notifications'):
+                    preview = full_text[:40] + "..." if len(full_text) > 40 else full_text
+                    rumps.notification(
+                        "✅ Speech2Text",
+                        f"Transcribed ({len(full_text)} chars)",
+                        f"'{preview}'"
+                    )
+                
+                logging.info(f"Transcribed {len(full_text)} chars")
+            else:
+                if self.settings.get('show_notifications'):
+                    rumps.notification("Speech2Text", "No Speech", "Could not detect speech")
+            
+            # Clean up
+            try:
+                temp_file.unlink()
+            except:
+                pass
+            
+            self.menu["Status: Transcribing..."] = "Status: Ready"
+            
+        except Exception as e:
+            logging.error(f"Transcription error: {e}", exc_info=True)
+            self.menu["Status: Transcribing..."] = "Status: Error"
+    
+    def paste_text(self):
+        """Simulate Cmd+V"""
+        try:
+            cmd = '''
+            tell application "System Events"
+                keystroke "v" using command down
+            end tell
+            '''
+            subprocess.run(['osascript', '-e', cmd], capture_output=True)
+        except Exception as e:
+            logging.error(f"Paste failed: {e}")
+    
+    @rumps.clicked("Settings...")
+    def open_settings(self, _):
+        """Open settings window"""
+        win = SettingsWindow(self.settings)
+        if win.run():
+            # Apply settings
+            self.model = None  # Force reload model if changed
+            self.hotkeys.stop()
+            self.hotkeys.start(
+                self.settings.get('hotkey_start'),
+                self.settings.get('hotkey_stop')
+            )
+            self.update_menu()
+            
+            # Handle login item
+            if self.settings.get('start_at_login'):
+                self.add_to_login_items()
+            
+            rumps.notification("Settings", "Saved", "Settings updated successfully")
+    
+    def add_to_login_items(self):
+        """Add app to login items"""
+        try:
+            app_path = os.path.abspath(sys.argv[0])
+            cmd = f'''
+            tell application "System Events"
+                make login item at end with properties {{path:"{app_path}", hidden:false}}
+            end tell
+            '''
+            subprocess.run(['osascript', '-e', cmd])
+        except Exception as e:
+            logging.error(f"Failed to add to login items: {e}")
+    
+    @rumps.clicked("Stats")
+    def show_stats(self, _):
+        """Show usage statistics"""
+        session_time = datetime.now() - self.stats['session_start']
+        hours = session_time.total_seconds() / 3600
+        
+        stats_text = f"""
+Session Statistics:
+------------------
+Recordings: {self.stats['recordings']}
+Total Time: {self.stats['total_time']:.1f} seconds
+Total Chars: {self.stats['total_chars']}
+Session Length: {hours:.1f} hours
+
+Average Recording: {self.stats['total_time']/max(1,self.stats['recordings']):.1f}s
+Average Text Length: {self.stats['total_chars']/max(1,self.stats['recordings']):.0f} chars
+
+Model: {self.settings.get('model_size')}
+Language: {self.settings.get('language')}
+Auto-Paste: {self.settings.get('auto_paste')}
+
+Hotkeys:
+  Start: {self.settings.get('hotkey_start')}
+  Stop: {self.settings.get('hotkey_stop')}
+"""
+        
+        rumps.alert("📊 Speech2Text Stats", stats_text)
+    
+    @rumps.clicked("Open Logs")
+    def open_logs(self, _):
+        """Open logs folder in Finder"""
+        subprocess.run(['open', str(log_dir)])
+    
+    @rumps.clicked("Model: tiny")
+    @rumps.clicked("Model: base")
+    @rumps.clicked("Model: small")
+    @rumps.clicked("Model: medium")
+    def change_model(self, sender):
+        """Change model size"""
+        model = sender.title.replace("Model: ", "")
+        self.settings.set('model_size', model)
+        self.model = None  # Force reload
+        self.update_menu()
+        rumps.notification("Model Changed", f"Using {model} model", "Will load on next transcription")
+    
+    @rumps.clicked("Language: en")
+    @rumps.clicked("Language: es")
+    @rumps.clicked("Language: fr")
+    @rumps.clicked("Language: de")
+    @rumps.clicked("Language: zh")
+    def change_language(self, sender):
+        """Change language"""
+        lang = sender.title.replace("Language: ", "")
+        self.settings.set('language', lang)
+        self.update_menu()
+        rumps.notification("Language Changed", f"Using {lang}", "Will apply to next transcription")
+    
+    @rumps.clicked("Quit")
+    def quit_app(self, _):
+        """Quit the app"""
+        logging.info("Quitting app")
+        self.hotkeys.stop()
+        cleanup_lock()
+        rumps.quit_application()
+
+if __name__ == "__main__":
+    app = Speech2TextApp()
+    app.run()
