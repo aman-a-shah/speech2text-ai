@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whisper-key-local"
+version = "0.7.1"
+description = "Local faster-whisper speech-to-text app with global hotkeys for Windows"
+readme = "README.md"
+license = "MIT"
+authors = [
+    {name = "Pin Wang", email = "pinwang@gmail.com"}
+]
+requires-python = ">=3.11"
+dependencies = [
+    # Cross-platform
+    "faster-whisper>=1.2.1",
+    "ctranslate2>=4.6.3",
+    "numpy>=1.24.0",
+    "soxr>=0.3.0",
+    "sherpa-onnx>=1.11.3",
+    "sounddevice>=0.4.6",
+    "pyperclip>=1.8.2",
+    "ruamel.yaml>=0.18.14",
+    "pystray>=0.19.5",
+    "Pillow>=10.0.0",
+    "hf-xet>=1.1.5",
+    "playsound3>=2.0",
+    "ten-vad>=1.0.6",
+
+    # Windows-only
+    "global-hotkeys>=0.1.7; sys_platform=='win32'",
+    "pywin32>=306; sys_platform=='win32'",
+
+    # macOS-only
+    "pyobjc-framework-Quartz; sys_platform=='darwin'",
+    "pyobjc-framework-ApplicationServices; sys_platform=='darwin'",
+]
+
+[project.scripts]
+whisper-key = "whisper_key.main:main"
+wk = "whisper_key.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"whisper_key" = ["assets/**/*", "platform/*/assets/*", "config.defaults.yaml", "commands.defaults.yaml"]
