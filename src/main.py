@@ -376,3 +376,22 @@ if __name__ == "__main__":
         app.run()
     finally:
         cleanup_lock()
+
+"""
+# 4. Rebuild with ONLY the correct imports
+pyinstaller --windowed \
+            --name "Speech2Text Pro" \
+            --add-data "src:src" \
+            --hidden-import rumps \
+            --hidden-import sounddevice \
+            --hidden-import numpy \
+            --hidden-import scipy \
+            --hidden-import pyperclip \
+            --hidden-import faster_whisper \
+            --hidden-import pynput \
+            --collect-all faster_whisper \
+            src/main.py
+
+# 5. Run the freshly built app
+./dist/Speech2Text\ Pro.app/Contents/MacOS/Speech2Text\ Pro
+"""
